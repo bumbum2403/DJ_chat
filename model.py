@@ -41,9 +41,9 @@ class GraphState(TypedDict):  # Overall graph state
 
 def authenticate(state: GraphState) -> GraphState:
     """Authenticates with Spotify API and gets access token."""
-    scope = "playlist-modify-public playlist-read-private"  # Add more scopes as needed
-    sp_oauth = SpotifyOAuth(client_id=os.environ.get("SPOTIPY_CLIENT_ID"),
-                            client_secret=os.environ.get("SPOTIPY_CLIENT_SECRET"),
+    scope = "playlist-modify-public playlist-read-private playlist-modify-private playlist-modify-public"  # Add more scopes as needed
+    sp_oauth = SpotifyOAuth(client_id=os.environ.get("SPOTIFY_CLIENT_ID"),
+                            client_secret=os.environ.get("SPOTIFY_CLIENT_SECRET"),
                             redirect_uri="http://localhost:8888/callback",  # Or your redirect URI
                             scope=scope)
 
@@ -68,7 +68,7 @@ def authenticate(state: GraphState) -> GraphState:
     return state
 
 
-def get_playlist_data(state: GraphState) -> GraphState:
+# def get_playlist_data(state: GraphState) -> GraphState:
     """Retrieves playlist and track metadata."""
     access_token = state["access_token"]
     sp = spotipy.Spotify(auth=access_token)
@@ -109,6 +109,70 @@ def get_playlist_data(state: GraphState) -> GraphState:
 
     state["track_metadata"] = track_metadata
     return state
+
+from langchain.agents import Tool, AgentExecutor, ZeroShotAgent, initialize_agent, AgentType
+
+def get_playlist_data(state: GraphState) -> GraphState:
+    """Retrieves playlist and track metadata using LLM for playlist identification."""
+    access_token = state["access_token"]
+    sp = spotipy.Spotify(auth=access_token)
+    llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=0)
+
+    user_query = state["user_query"]
+    if not user_query or not user_query.get("query"):
+        raise ValueError("User query is missing.")
+
+    query = user_query["query"]
+
+    # 1. LLM Tool Call for Playlist Identification
+    playlist_tool = Tool(
+        name="GetPlaylistID",
+        func=lambda playlist_name_or_id: _get_playlist_id(sp, playlist_name_or_id),  # Helper function (see below)
+        description="""
+        Use this tool to get the playlist ID. Input should be a string which is the name of the playlist, or the ID of the playlist.
+        """,
+    )
+
+    tools = [playlist_tool]
+    agent = initialize_agent(tools, llm, agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION, verbose=True)
+
+    try:
+        playlist_id = agent.run(query)  # LLM decides which tool to call
+    except ValueError as e: # if there is no playlist by that name
+        raise ValueError(f"Playlist not found: {e}")
+    except Exception as e:
+        raise ValueError(f"Error finding playlist: {e}")
+
+    playlist = sp.playlist(playlist_id)
+
+    track_metadata: List[TrackMetadata] = []
+    for item in playlist['tracks']['items']:
+      track = item['track']
+      if track:
+        track_metadata.append({
+            "id": track['id'],
+            "name": track['name'],
+            "artist": track['artists'][0]['name'],  # Assuming one artist for simplicity
+            "genre": None,  # Spotify API doesn't directly provide genre for tracks
+            "bpm": None,  # will need to use a  separate API endpoint for BPM
+            "key": None,  # for key as well {refer web API specs}
+        })
+
+    state["track_metadata"] = track_metadata
+    return state
+
+def _get_playlist_id(sp: spotipy.Spotify, playlist_name_or_id: str) -> str:
+    """Helper function to get playlist ID from name or ID."""
+    try:
+        playlist = sp.playlist(playlist_name_or_id)  # Try if it's an ID
+        return playlist['id']
+    except:
+        playlists = sp.current_user_playlists()
+        for pl in playlists['items']:
+            if pl['name'] == playlist_name_or_id:
+                return pl['id']
+        raise ValueError(f"Playlist with name or ID '{playlist_name_or_id}' not found.")
+
 
 
 def call_llm(state: GraphState) -> GraphState:
